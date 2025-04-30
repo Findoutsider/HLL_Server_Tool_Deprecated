@@ -1,18 +1,34 @@
 from Log import log
 from connection import HLLConnectionPool, async_send_command
+from dataStorage import DataStorage
+from credentials_manager import CredentialsManager
 
 SUCCESS = "SUCCESS"
 
 
 def convert_tabs_to_spaces(value: str) -> str:
-    """Convert tabs to a space to not break HLL tab delimited lists"""
     return value.replace("\t", " ")
 
 
 class Commands:
     def __init__(self):
-        self.connection_pool = HLLConnectionPool("89.46.1.190", 7839, "2hm14")
+        # 获取凭证
+        cred_manager = CredentialsManager()
+        credentials = cred_manager.get_credentials()
+        
+        if not credentials:
+            self.logger = log()
+            self.logger.error("未找到服务器凭证，请先运行 reset_credentials.py 设置凭证")
+            raise ValueError("未找到服务器凭证")
+            
+        # 创建连接池 - 使用从凭证管理器获取的信息
+        self.connection_pool = HLLConnectionPool(
+            credentials["host"], 
+            int(credentials["port"]),  # 确保端口是整数类型
+            credentials["password"]
+        )
         self.logger = log()
+        self.data = DataStorage("data.db")  # 初始化数据存储
 
     async def __send_quest(self, command: str, can_fail=True, log_info=False) -> str:
         """使用连接池发送命令，使用异步包装函数调用同步方法"""
@@ -72,6 +88,9 @@ class Commands:
     async def get_slots(self) -> str:
         return await self.__send_quest("get slots")
 
+    async def get_objectives_row(self, row: int) -> str:
+        return await self.__send_quest(f"get objectiverow_{row}")
+
     def _is_info_correct(self, player, raw_data) -> bool:
         try:
             lines = raw_data.encode().split("\n")
@@ -91,23 +110,77 @@ class Commands:
         return await self.__send_quest("get votekickthreshold", can_fail=False)
 
     async def get_map_rotation(self) -> list[str]:
+        """获取地图轮换列表
+        
+        Returns:
+            地图ID列表，如 ["stmariedumont_warfare", "foy_offensive_ger", ...]
+        """
         result = await self.__send_quest("rotlist", can_fail=False)
-        return result.split("\n") if result else []
+        if not result:
+            return []
+            
+        # 分行处理
+        map_list = []
+        lines = result.split("\n")
+        for line in lines:
+            if not line.strip():
+                continue
+                
+            # 处理可能的格式：序号+地图ID，如 "1 stmariedumont_warfare"
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                map_list.append(parts[1].strip())
+            else:
+                map_list.append(line.strip())
+                
+        # 过滤掉所有纯数字项
+        map_list = [x for x in map_list if not x.isdigit()]
+        
+        # 记录日志以便调试
+        self.logger.debug(f"地图轮换列表解析结果: {map_list}")
+        
+        return map_list
 
     async def get_vip_ids(self):
         res = await self.__send_quest("get vipids")
+        if not res:
+            return []
 
-        vip_ids = []
-        for item in res:
-            try:
-                player_id, name = item.split(" ", 1)
-                name = name.replace('"', "")
-                name = name.replace("\n", "")
-                name = name.strip()
-                vip_ids.append({"player_id": player_id, "name": name})
-            except ValueError as e:
-                log.exception(e)
-        return vip_ids
+        try:
+            # 分割结果
+            parts = res.split("\t")
+            if len(parts) < 2:
+                self.logger.warning(f"VIP列表格式错误: {res}")
+                return []
+
+            # 跳过第一个数字（VIP数量）
+            vip_list = parts[1]
+            vip_ids = []
+
+            # 处理VIP列表
+            for item in vip_list.split("\t"):
+                if not item:
+                    continue
+
+                # 尝试解析ID和名称
+                try:
+                    # 分割ID和名称
+                    if " " in item:
+                        player_id, name = item.split(" ", 1)
+                        # 清理名称中的引号
+                        name = name.replace('"', "").strip()
+                        vip_ids.append({"player_id": player_id.strip(), "name": name})
+                    else:
+                        # 如果没有名称，只添加ID
+                        vip_ids.append({"player_id": item.strip(), "name": ""})
+                except ValueError as e:
+                    self.logger.warning(f"解析VIP项失败: {item}, 错误: {e}")
+                    continue
+
+            return vip_ids
+        except Exception as e:
+            self.logger.error(f"处理VIP列表失败: {e}")
+            return []
 
     async def get_admin_groups(self):
         return await self.__send_quest("get admingroups")
@@ -160,6 +233,16 @@ class Commands:
 
     async def set_broadcast(self, message: str):
         return await self.__send_quest(f'broadcast "{message}"')
+
+    async def set_game_layout(self, objectives: list[str]):
+        if len(objectives) != 5:
+            raise ValueError("5 objectives must be provided")
+        await self.__send_quest(
+            f'gamelayout "{objectives[0]}" "{objectives[1]}" "{objectives[2]}" "{objectives[3]}" "{objectives[4]}"',
+            log_info=True,
+            can_fail=False,
+        )
+        return list(objectives)
 
     async def set_votekick_enabled(self, value: str):
         """
@@ -218,8 +301,14 @@ class Commands:
             duration_hours: int = 2,
             reason: str = "",
             admin_name: str = "",
+            use_id: bool = False
     ):
         reason = convert_tabs_to_spaces(reason)
+        # 当use_id为True时，player_name被视为ID
+        if use_id and player_name:
+            player_id = player_name
+            player_name = None
+        
         return "执行成功" if await self.__send_quest(
             f'tempban "{player_id or player_name}" {duration_hours} "{reason}" '
             f'"{admin_name}"') else "执行失败"
@@ -230,8 +319,14 @@ class Commands:
             player_id: str | None = None,
             reason: str = "",
             admin_name: str = "",
+            use_id: bool = False
     ):
         reason = convert_tabs_to_spaces(reason)
+        # 当use_id为True时，player_name被视为ID
+        if use_id and player_name:
+            player_id = player_name
+            player_name = None
+            
         return "执行成功" if await self.__send_quest(f'permaban "{player_id or player_name}" "{reason}" "{admin_name}"') \
             else "执行失败"
 
@@ -255,13 +350,56 @@ class Commands:
         return await self.__send_quest(f"admindel {player_id}", log_info=True) == SUCCESS
 
     async def add_vip(self, player_id: str, description: str) -> bool:
-        description = convert_tabs_to_spaces(description)
-        return await self.__send_quest(
-            f'vipadd "{player_id}" "{description}"', log_info=True
-        ) == SUCCESS
+        """添加VIP到游戏系统
+        
+        Args:
+            player_id: 玩家ID
+            description: 描述
+            
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 使用游戏命令添加VIP
+            result = await self.__send_quest(f"vipadd {player_id} '{description}'", log_info=True)
+            return result == SUCCESS
+        except Exception as e:
+            self.logger.error(f"添加游戏VIP失败: {str(e)}")
+            return False
 
     async def remove_vip(self, player_id) -> bool:
-        return await self.__send_quest(f"vipdel {player_id}", log_info=True) == SUCCESS
+        """移除VIP
+        
+        Args:
+            player_id: 玩家ID
+            
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 先检查数据库中是否有记录
+            existing_vip = await self.data.async_get_vip(player_id)
+            if not existing_vip:
+                self.logger.warning(f"玩家 {player_id} 不是数据库中的VIP，跳过移除")
+                return True
+
+            # 从游戏VIP系统移除
+            game_vip_removed = await self.__send_quest(f"vipdel {player_id}", log_info=True) == SUCCESS
+            if not game_vip_removed:
+                self.logger.error(f"从游戏移除VIP失败: {player_id}")
+                return False
+
+            # 从数据库VIP系统移除
+            db_vip_removed = await self.data.async_remove_vip(player_id)
+            if not db_vip_removed:
+                self.logger.error(f"从数据库移除VIP失败: {player_id}")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"移除VIP失败: {str(e)}")
+            return False
 
     async def message_player(self, player_name: str, message: str) -> None:
         await self.__send_quest(f'message {player_name} {message}')

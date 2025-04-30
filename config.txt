@@ -1,0 +1,18 @@
+# 请填写username和password或csrftoken和sessionid，无需全部填写
+
+cooldown=5
+port=3000
+username=
+password=
+
+csrftoken=
+sessionid=
+
+# # 可使用远程命令的qq号
+admin=[2275016544]
+
+# 屏蔽的qq号
+ignore=[3821743226]
+
+read_amount=1
+qq_group=532933387

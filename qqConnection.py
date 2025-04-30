@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from typing import Optional
@@ -20,6 +21,10 @@ processed_messages = set()  # 存储已处理的消息ID
 
 # 正在处理中的连接请求计数
 pending_connection_requests = 0
+
+
+def _command_prefix(message: str) -> str:
+    return message[1:] if message.startswith("*") else False
 
 
 class Bot:
@@ -50,7 +55,7 @@ class Bot:
         if new_admin_list:
             self.admin = new_admin_list
             logger.info(f"已更新管理员列表，共 {len(self.admin)} 名管理员")
-        
+
     def msg_listener(self, r, get):
         if not r:
             return False
@@ -109,25 +114,25 @@ class LoginInformation:
 async def get_connection() -> Optional[HLLConnection]:
     """获取一个可用的连接，使用正确的异步方式"""
     global pending_connection_requests
-    
+
     try:
         # 增加等待连接计数，用于防止连接风暴
         pending_connection_requests += 1
-        
+
         # 如果有太多挂起的请求，则立即返回None
         if pending_connection_requests > 5:
             logger.warning(f"已有 {pending_connection_requests} 个连接请求，正在等待...")
             return None
-            
+
         # 使用同步方法获取连接
         conn = ctx.connection_pool.get_connection()
-        
+
         # 如果没有可用连接，等待一下再尝试一次
         if conn is None:
             logger.info("没有可用连接，等待500ms后重试...")
             await asyncio.sleep(0.5)
             conn = ctx.connection_pool.get_connection()
-            
+
         return conn
     except Exception as e:
         # logger.error(f"获取连接失败: {e}")
@@ -142,7 +147,7 @@ async def release_connection(conn: Optional[HLLConnection]):
     if conn is None:
         # 不需要处理None连接
         return
-        
+
     try:
         ctx.connection_pool.release_connection(conn)
     except Exception as e:
@@ -153,22 +158,22 @@ async def send_command(command: str) -> str:
     """发送命令到HLL服务器，使用更可靠的连接管理"""
     conn = None
     retries = 2
-    
+
     for attempt in range(retries):
         try:
             conn = await get_connection()
             if not conn:
                 if attempt == retries - 1:
                     return "无法获取连接到游戏服务器"
-                logger.warning(f"无法获取连接，等待重试 ({attempt+1}/{retries})...")
+                logger.warning(f"无法获取连接，等待重试 ({attempt + 1}/{retries})...")
                 await asyncio.sleep(1)
                 continue
-            
+
             # 使用连接发送命令
             response = conn.send_command(command)
             return response
         except Exception as e:
-            logger.error(f"发送命令失败 (尝试 {attempt+1}/{retries}): {e}")
+            logger.error(f"发送命令失败 (尝试 {attempt + 1}/{retries}): {e}")
             if attempt == retries - 1:
                 return f"命令执行失败: {str(e)}"
             await asyncio.sleep(1)  # 等待一会再重试
@@ -176,8 +181,48 @@ async def send_command(command: str) -> str:
             # 确保连接被释放
             if conn:
                 await release_connection(conn)
-    
+
     return "命令执行失败: 连接问题"
+
+
+async def send_forward_message(message: list):
+    """发送合并消息到QQ群
+
+    Args:
+        message: 消息内容列表，每个元素都是一条单独的消息
+
+    Returns:
+        构造好的payload
+    """
+    # 创建一个全新的payload，而不是修改Bot类中的模板
+    # 正确的合并转发消息格式
+    payload = {
+        "group_id": bot.qq_group,
+        "messages": []
+    }
+
+    # 为每条消息创建一个独立的节点
+    for i, msg in enumerate(message):
+        node = {
+            "type": "node",
+            "data": {
+                "name": "",  # 可选的昵称
+                "uin": "",   # 可选的QQ号
+                "content": [{     # 内容必须是列表
+                    "type": "text",
+                    "data": {
+                        "text": msg
+                    }
+                }]
+            }
+        }
+        payload["messages"].append(node)
+        logger.debug(f"添加转发消息 {i+1}/{len(message)}: {msg[:30]}...")
+
+    # 记录完整的发送负载，便于调试
+    logger.debug(f"构造合并消息完成，共 {len(message)} 条消息")
+    
+    return payload
 
 
 async def handle_qq_message(message: list[str], is_admin: bool = False) -> None:
@@ -186,20 +231,31 @@ async def handle_qq_message(message: list[str], is_admin: bool = False) -> None:
         # 更新最后活动时间
         global last_activity
         last_activity = time.time()
-        
+
         # 获取消息内容
         if not message:
             return
-            
+
         # 检查是否是命令
         response = await qq_Commands(message, is_admin)
+        qq_response = None
+
         # 发送响应到QQ
-        bot.send_payload["message"] = response
-        if bot.send_payload["message"]:
-            qq_response = requests.post(bot.send_url, json=bot.send_payload, headers=bot.headers_bot)
-            logger.info(f"尝试发送消息到QQ: {bot.send_payload['message']}")
+        if isinstance(response, str):
+            # 普通文本消息
+            payload = bot.send_payload.copy()  # 创建副本避免修改原始对象
+            payload["message"] = response
+            qq_response = requests.post(bot.send_url, json=payload, headers=bot.headers_bot)
+        elif isinstance(response, list):
+            # 合并转发消息
+            payload = await send_forward_message(response)
+            # 使用正确的合并转发API
+            forward_url = f"http://127.0.0.1:{bot.port}/send_group_forward_msg"
+            qq_response = requests.post(forward_url, json=payload, headers=bot.headers_bot)
+        
+        if qq_response:
             logger.info(f"发送消息到QQ: {qq_response.json()}")
-        logger.info(f"执行命令: {message}, 响应: {response}")
+        logger.info(f"执行命令: {message}, 响应: {response} | {type(response)}")
     except Exception as e:
         logger.error(f"处理QQ消息时出错: {e}", exc_info=True)
 
@@ -213,13 +269,13 @@ async def keepalive_loop():
                 # 发送空命令保持连接活跃
                 await send_command("")
                 logger.debug("发送保活命令")
-            
+
             # 检查是否超过最大空闲时间
             if current_time - last_activity > max_idle_time:
                 logger.warning("连接空闲时间过长，重新连接...")
                 # 重新初始化连接池
                 await async_close_all(ctx.connection_pool)
-            
+
             await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"保活循环出错: {e}")
@@ -228,17 +284,17 @@ async def keepalive_loop():
 
 async def receive_qq_message():
     global processed_messages
-    
+
     # 清理过旧的消息ID，防止集合过大
     if len(processed_messages) > 100:
         logger.info(f"清理消息ID集合，当前大小: {len(processed_messages)}")
         processed_messages.clear()
-        
+
     while True:
         try:
             response = requests.post(bot.receive_url, json=bot.receive_payload, headers=bot.headers_bot)
             res = response.json().get('data').get("messages")
-            
+
             if not res:
                 await asyncio.sleep(0.5)
                 continue
@@ -250,7 +306,7 @@ async def receive_qq_message():
                 logger.debug(f"跳过已处理的消息ID: {message_id}")
                 await asyncio.sleep(0.5)
                 continue
-                
+
             # 添加到已处理集合
             if message_id:
                 processed_messages.add(str(message_id))
@@ -258,7 +314,7 @@ async def receive_qq_message():
 
             is_admin = bot.msg_listener(res, "role")
             qq_id = bot.msg_listener(res, "qq")
-            
+
             # 确保qq_id和ignore中的元素类型匹配
             if qq_id is not None and bot.ignore:
                 # 转换qq_id和ignore为同一类型进行比较
@@ -273,7 +329,7 @@ async def receive_qq_message():
                 except Exception as e:
                     logger.error(f"类型转换出错: {e}")
                     continue
-            
+
             try:
                 res = ''.join(res[0].get('message'))
                 if not res.strip():  # 忽略空消息
@@ -283,12 +339,15 @@ async def receive_qq_message():
             except TypeError as e:
                 logger.error(f"消息拼接出错: {e}")
                 continue
-                
+
             res = res.split(" ", 1)
             if len(res) == 1:
                 res.append("")  # 确保res至少有两个元素
-            
+
             logger.info(f"收到新消息: {res[0]}, 消息ID: {message_id}, 是否管理员: {is_admin}")
+            res[0] = _command_prefix(res[0])
+            if not res[0]:
+                return
             return res, is_admin
         except Exception as e:
             logger.error(f"receive_qq_message出错: {e}")
@@ -303,20 +362,20 @@ async def qq_bot():
     last_admin_refresh_time = time.time()  # 上次刷新管理员列表的时间
     admin_refresh_interval = 60  # 管理员列表刷新间隔（秒）
     min_message_interval = 0.5  # 最小消息处理间隔（秒）
-    
+
     try:
         # 首次加载管理员列表
         admin_list = ctx.data.get_all_qq_admins()
         if admin_list:
             bot.update_admin_list(admin_list)
             logger.info(f"从数据库加载管理员列表: {admin_list}")
-        
+
         # 启动保活循环
-        keepalive_task = asyncio.create_task(keepalive_loop())
-        
+        # keepalive_task = asyncio.create_task(keepalive_loop())
+
         # 初始化QQ机器人连接
         logger.info("QQ机器人启动完成，正在监听消息...")
-        
+
         while True:
             try:
                 # 定期刷新管理员列表
@@ -325,23 +384,23 @@ async def qq_bot():
                     admin_list = ctx.data.get_all_qq_admins()
                     bot.update_admin_list(admin_list)
                     last_admin_refresh_time = current_time
-                
+
                 # 接收QQ消息
                 message = await receive_qq_message()
-                
+
                 # 处理消息，包含频率限制
                 if message:
                     current_time = time.time()
                     time_since_last_message = current_time - last_message_time
-                    
+
                     if time_since_last_message < min_message_interval:
                         # 如果距离上次处理消息时间太短，等待一下
                         await asyncio.sleep(min_message_interval - time_since_last_message)
-                    
+
                     # 处理消息
                     await handle_qq_message(message[0], message[1])
                     last_message_time = time.time()
-                
+
                 # 适当等待，避免CPU使用率过高
                 await asyncio.sleep(0.2)
             except Exception as e:
@@ -349,14 +408,14 @@ async def qq_bot():
                 await asyncio.sleep(1)
     except Exception as e:
         logger.error(f"QQ机器人异常: {e}")
-    finally:
-        if keepalive_task is not None:
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
-        
+        # finally:
+        #     if keepalive_task is not None:
+        #         keepalive_task.cancel()
+        #         try:
+        #             await keepalive_task
+        #         except asyncio.CancelledError:
+        #             pass
+
         logger.info("关闭QQ机器人连接池...")
         await async_close_all(ctx.connection_pool)
 
@@ -366,26 +425,27 @@ async def main():
     try:
         # 初始化上下文
         await ctx.initialize()
-        
+
         logger.info("启动QQ机器人...")
         await qq_bot()
     except Exception as e:
         logger.error(f"QQ机器人异常: {e}")
 
+
 if __name__ == "__main__":
     login_info = LoginInformation()
     credentials = login_info.read()
-    
+
     # 解析配置文件中的ignore列表
     ignore_list = eval(credentials.get("ignore", "[]")) if "ignore" in credentials else []
-    
+
     bot = Bot(
         qq_group=credentials.get("qq_group", "532933387"),
         read_amount=credentials.get("read_amount", "1"),
         port=credentials.get("port", "3000"),
         ignore=ignore_list
     )
-    
+
     # 初始化连接池
     ctx = Context()
     asyncio.run(main())

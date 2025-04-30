@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 
 # 基础配置
 MSGLEN = 32_768
-TIMEOUT_SEC = 5  # 缩短超时时间
+TIMEOUT_SEC = None  # 移除超时时间，允许无限等待
 MAX_CONNECTIONS = 3  # 减少最大连接数
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ class HLLConnection:
         self.password = password
         self.xorkey = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(TIMEOUT_SEC)
+        self.sock.settimeout(None)  # 移除超时设置，让连接永久保持
         self.last_activity = time.time()
         self.lock = threading.RLock()
         self._is_connected = False
@@ -52,7 +52,7 @@ class HLLConnection:
                 
                 # 创建新socket
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(TIMEOUT_SEC)
+                self.sock.settimeout(None)  # 移除超时设置，让连接永久保持
                 
                 # 连接到服务器
                 self.sock.connect((self.host, self.port))

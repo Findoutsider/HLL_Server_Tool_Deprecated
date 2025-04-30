@@ -1,10 +1,8 @@
 # log_loop.py
-import re
-import time
 import asyncio
+import re
 from collections import deque
-from datetime import datetime
-from typing import Iterable, Tuple, Dict, Any, Union
+from typing import Iterable, Tuple, Union
 
 from Log import log
 from commands import Commands

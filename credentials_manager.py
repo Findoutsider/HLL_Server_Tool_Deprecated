@@ -2,10 +2,8 @@ import os
 import base64
 import logging
 import sqlite3
+import hashlib
 from typing import Dict, Optional, Tuple
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 logger = logging.getLogger(__name__)
 
@@ -73,47 +71,59 @@ class CredentialsManager:
         
         # 使用简单的机器标识作为密码
         # 在生产环境中，应该使用更强的密码策略
-        password = (os.name + os.getlogin() + os.environ.get('COMPUTERNAME', '')).encode()
+        password = (os.name + os.environ.get('USER', os.environ.get('USERNAME', 'user'))).encode()
         
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-        )
+        # 使用hashlib代替cryptography
+        key = hashlib.pbkdf2_hmac('sha256', password, salt, 100000, 32)
+        key = base64.urlsafe_b64encode(key)
         
-        key = base64.urlsafe_b64encode(kdf.derive(password))
         return key, salt
     
-    def _encrypt(self, data: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
-        """加密数据
+    def _encrypt(self, data: str, salt: Optional[bytes] = None) -> Tuple[str, bytes]:
+        """使用简单的XOR加密数据
         
         Args:
             data: 要加密的数据
             salt: 可选的盐值
             
         Returns:
-            (加密数据, 盐值)的元组
+            (加密数据的Base64编码, 盐值)的元组
         """
         key, salt = self._generate_key(salt)
-        cipher = Fernet(key)
-        encrypted_data = cipher.encrypt(data.encode())
-        return encrypted_data, salt
+        
+        # 简单的XOR加密
+        key_bytes = base64.urlsafe_b64decode(key)
+        data_bytes = data.encode('utf-8')
+        encrypted = bytearray()
+        
+        for i in range(len(data_bytes)):
+            encrypted.append(data_bytes[i] ^ key_bytes[i % len(key_bytes)])
+        
+        # 返回Base64编码的加密数据
+        return base64.b64encode(encrypted).decode('utf-8'), salt
     
-    def _decrypt(self, encrypted_data: bytes, salt: bytes) -> str:
+    def _decrypt(self, encrypted_data: str, salt: bytes) -> str:
         """解密数据
         
         Args:
-            encrypted_data: 加密的数据
+            encrypted_data: Base64编码的加密数据
             salt: 用于生成密钥的盐值
             
         Returns:
             解密后的数据
         """
         key, _ = self._generate_key(salt)
-        cipher = Fernet(key)
-        decrypted_data = cipher.decrypt(encrypted_data)
-        return decrypted_data.decode()
+        
+        # 解码为字节
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        key_bytes = base64.urlsafe_b64decode(key)
+        
+        # XOR解密
+        decrypted = bytearray()
+        for i in range(len(encrypted_bytes)):
+            decrypted.append(encrypted_bytes[i] ^ key_bytes[i % len(key_bytes)])
+        
+        return decrypted.decode('utf-8')
     
     def save_credentials(self, host: str, port: int, password: str) -> bool:
         """加密并保存服务器凭证

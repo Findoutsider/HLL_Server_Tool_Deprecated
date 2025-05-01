@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import re
 import time
+import os
 from typing import Dict, Any, List
 
 import Log
@@ -36,7 +37,46 @@ map_commands = ["map", "切图"]
 # 初始化管理员列表
 admin_list = []
 
-qq_group = 1020644075
+# 从配置文件中读取QQ群号
+def read_config_value(filename, key, default_value=None):
+    """从配置文件读取指定键的值
+    
+    Args:
+        filename: 配置文件名
+        key: 要读取的键名
+        default_value: 如果键不存在时的默认值
+    
+    Returns:
+        配置值或默认值
+    """
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), filename)
+        if not os.path.exists(config_path):
+            logger.warning(f"配置文件 {filename} 不存在，使用默认值")
+            return default_value
+            
+        with open(config_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 跳过注释和空行
+                if not line or line.startswith('#'):
+                    continue
+                    
+                # 解析键值对
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    if k.strip() == key:
+                        return v.strip()
+        
+        # 如果没找到键，返回默认值
+        logger.warning(f"在配置文件 {filename} 中未找到键 {key}，使用默认值")
+        return default_value
+    except Exception as e:
+        logger.error(f"读取配置文件 {filename} 时出错: {e}")
+        return default_value
+
+# 读取QQ群号，如果读取失败则使用默认值
+qq_group = int(read_config_value('config.txt', 'qq_group', '1020644075'))
 
 
 class Context:
